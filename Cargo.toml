@@ -1,0 +1,9 @@
+[package]
+name = "nom80211"
+version = "0.1.0"
+authors = ["tomhol"]
+edition = "2018"
+
+[dependencies]
+nom = "^4.2"
+eui48 = "0.4.6"
