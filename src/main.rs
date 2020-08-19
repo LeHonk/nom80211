@@ -1,8 +1,12 @@
-#[macro_use]
-extern crate nom;
-
-use nom::{be_u8, be_u16, be_u32};
 use eui48::MacAddress;
+use nom::bits::bits;
+use nom::bits::complete::{tag,take};
+use nom::combinator::{cond, map, map_res};
+use nom::Err;
+use nom::error::ErrorKind;
+use nom::multi::count;
+use nom::number::complete::{be_u16, be_u32, be_u8};
+use nom::IResult;
 
 pub struct Frame {
     fc: FrameControl,
@@ -86,6 +90,7 @@ impl From<u8> for ManagementSubtype {
 }
 
 pub enum ControlSubtype {
+    Trigger,
     BeamformingReportPoll,
     VHTNDPAnouncement,
     ControlFrameExtension,
@@ -104,6 +109,7 @@ pub enum ControlSubtype {
 impl From<u8> for ControlSubtype {
     fn from(subtype: u8) -> ControlSubtype {
         match subtype {
+            0x02 => ControlSubType::Trigger,
             0x04 => ControlSubtype::BeamformingReportPoll,
             0x05 => ControlSubtype::VHTNDPAnouncement,
             0x06 => ControlSubtype::ControlFrameExtension,
@@ -185,114 +191,130 @@ impl From<u8> for ExtensionSubtype {
     }
 }
 
-named!(take_bool<(&[u8],usize), bool>,
-    map!(take_bits!(u8, 1), |u| u==1)
-);
+fn take_bool(i: (&[u8], usize)) -> IResult<(&[u8], usize), bool> {
+    map(take(1usize), |u: u8| u == 1)(i)
+}
 
-named!(control_subtype<(&[u8],usize), ControlSubtype>, 
-    map!(take_bits!(u8, 4), ControlSubtype::from)
-);
+fn control_subtype(i: (&[u8], usize)) -> IResult<(&[u8], usize), ControlSubtype> {
+    map(take(4usize), |c: u8| ControlSubtype::from(c))(i)
+}
 
-named!(management_subtype<(&[u8],usize), ManagementSubtype>,
-    map!(take_bits!(u8, 4), ManagementSubtype::from)
-);
+fn management_subtype(i: (&[u8], usize)) -> IResult<(&[u8], usize), ManagementSubtype> {
+    map(take(4usize), |m: u8| ManagementSubtype::from(m))(i)
+}
 
 //named!(data_subtype<(&[u8],usize), DataSubtype>,
 //    map!(take_bits!(u8, 4), DataSubtype::from)
 //);
 
-named!(data_subtype<(&[u8],usize), DataSubtype>,
-    do_parse!(
-        ack: call!(take_bool) >>
-        poll: call!(take_bool) >>
-        null: call!(take_bool) >>
-        qos: call!(take_bool) >>
-        ( DataSubtype{ data: !null, ack, poll, qos } )
-    )
-);
+fn data_subtype(i: (&[u8], usize)) -> IResult<(&[u8], usize), DataSubtype> {
+    let (i, ack) = take_bool(i)?;
+    let (i, poll) = take_bool(i)?;
+    let (i, _null) = take_bool(i)?;
+    let (i, qos) = take_bool(i)?;
+    Ok((
+        i,
+        DataSubtype {
+            data: false,
+            ack,
+            poll,
+            qos,
+        },
+    ))
+}
 
-named!(extension_subtype<(&[u8],usize), ExtensionSubtype>,
-    map!(take_bits!(u8, 4), ExtensionSubtype::from)
-);
+fn extension_subtype(i: (&[u8], usize)) -> IResult<(&[u8], usize), ExtensionSubtype> {
+    map(take(4usize), |e: u8| ExtensionSubtype::from(e))(i)
+}
 
-named!(control_type<(&[u8],usize), FrameType>,
-    map!(control_subtype, |subtype| FrameType::Control(subtype))
-);
+fn control_type(i: (&[u8], usize)) -> IResult<(&[u8], usize), FrameType> {
+    map(control_subtype, |subtype| FrameType::Control(subtype))(i)
+}
 
-named!(management_type<(&[u8],usize), FrameType>,
-    map!(management_subtype, |subtype| FrameType::Management(subtype))
-);
+fn management_type(i: (&[u8], usize)) -> IResult<(&[u8], usize), FrameType> {
+    map(management_subtype, |subtype| FrameType::Management(subtype))(i)
+}
 
-named!(data_type<(&[u8],usize), FrameType>,
-    map!(data_subtype, |subtype| FrameType::Data(subtype))
-);
+fn data_type(i: (&[u8], usize)) -> IResult<(&[u8], usize), FrameType> {
+    map(data_subtype, |subtype| FrameType::Data(subtype))(i)
+}
 
-named!(extension_type<(&[u8],usize), FrameType >,
-    map!(extension_subtype, |subtype| FrameType::Extension(subtype))
-);
+fn extension_type(i: (&[u8], usize)) -> IResult<(&[u8], usize), FrameType> {
+    map(extension_subtype, |subtype| FrameType::Extension(subtype))(i)
+}
 
-named!(frametype<(&[u8],usize), FrameType>,
-    switch!(take_bits!(u8, 2),
-                0b00 => call!(control_type) |
-                0b01 => call!(management_type) |
-                0b10 => call!(data_type) |
-                0b11 => call!(extension_type)
-    )
-);
+fn frametype(i: (&[u8], usize)) -> IResult<(&[u8], usize), FrameType> {
+    let (i, frametype) = take(2usize)(i)?;
+    match frametype {
+        0b00 => control_type(i),
+        0b01 => management_type(i),
+        0b10 => data_type(i),
+        0b11 => extension_type(i),
+        _ => Err(Err::Error((i, ErrorKind::Tag))),
+    }
+}
 
-named!(framecontrol<&[u8],FrameControl>,
-    bits!(
-        do_parse!(
-            version: tag_bits!(u8, 2, 0b00) >>
-            frametype: call!(frametype) >>
-            to_ds: call!(take_bool) >>
-            from_ds: call!(take_bool) >>
-            more_fragments: call!(take_bool) >>
-            retry: call!(take_bool) >>
-            power_mgmt: call!(take_bool) >>
-            more_data: call!(take_bool) >>
-            protected_frame: call!(take_bool) >>
-            order: call!(take_bool) >>
-            ( FrameControl {
-                version,
-                frametype,
-                to_ds,
-                from_ds,
-                more_fragments,
-                retry,
-                power_mgmt,
-                more_data,
-                protected_frame,
-                order,
-            } )
-        )
-    )
-);
+fn framecontrol(i: (&[u8], usize)) -> IResult<(&[u8], usize), FrameControl> {
+    let (i, version) = tag(0b00, 2usize)(i)?;
+    let (i, frametype) = frametype(i)?;
+    let (i, to_ds) = take_bool(i)?;
+    let (i, from_ds) = take_bool(i)?;
+    let (i, more_fragments) = take_bool(i)?;
+    let (i, retry) = take_bool(i)?;
+    let (i, power_mgmt) = take_bool(i)?;
+    let (i, more_data) = take_bool(i)?;
+    let (i, protected_frame) = take_bool(i)?;
+    let (i, order) = take_bool(i)?;
+    Ok((
+        i,
+        FrameControl {
+            version,
+            frametype,
+            to_ds,
+            from_ds,
+            more_fragments,
+            retry,
+            power_mgmt,
+            more_data,
+            protected_frame,
+            order,
+        },
+    ))
+}
 
-named!(sequencecontrol<&[u8],SequenceControl>,
-   bits!(
-       do_parse!(
-           sequence: take_bits!(u8, 4) >>
-           fragment: take_bits!(u16, 12) >> 
-           ( SequenceControl { sequence, fragment } )
-        )
-    )
-);
+fn sequencecontrol(i: (&[u8],usize)) -> IResult<(&[u8],usize), SequenceControl> {
+    let (i, sequence) = take(4usize)(i)?;  
+    let (i, fragment) = take(12usize)(i)?;
+    Ok((i, SequenceControl { sequence, fragment }))
+}
 
-named!(frame<&[u8],Frame>,
-    do_parse!(
-        fc: call!(framecontrol) >>
-        dur_id: be_u16 >>
-        address1: map_res!(take!( 6 ), MacAddress::from_bytes) >>
-        address2: map_res!(take!( 6 ), MacAddress::from_bytes) >>
-        address3: map_res!(take!( 6 ), MacAddress::from_bytes) >>
-        seq_ctrl: cond!(fc.more_fragments, call!(sequencecontrol)) >>
-        address4: map_res!(take!( 6 ), MacAddress::from_bytes) >>
-        qos_ctrl: cond!(false, be_u16) >>
-        ht_ctrl: cond!(false, be_u32) >>
-        body: many0!(be_u8) >>
-        fcs: be_u32 >>
-        ( Frame {
+fn mac_address(i: &[u8]) -> IResult<&[u8], MacAddress> {
+    use nom::bytes::complete::take;
+    map_res(take(6usize), MacAddress::from_bytes)(i)
+}
+
+fn qos(fc: &FrameControl) -> bool {
+    match &fc.frametype {
+        FrameType::Data(d) => d.qos,
+        _ => false,
+    }
+}
+
+fn frame(i: &[u8]) -> IResult<&[u8], Frame> {
+    let (i, fc) = bits(framecontrol)(i)?;
+    let (i, dur_id) = be_u16(i)?;
+    let (i, address1) = mac_address(i)?;
+    let (i, address2) = mac_address(i)?;
+    let (i, address3) = mac_address(i)?;
+    let (i, seq_ctrl) = cond(fc.more_fragments, bits(sequencecontrol))(i)?;
+    let (i, address4) = mac_address(i)?;
+    let (i, qos_ctrl) = cond(qos(&fc), be_u16,)(i)?;
+    let (i, ht_ctrl) = cond(false, be_u32)(i)?; // TODO Is this correct?
+    let (i, body) = count(be_u8, 0usize)(i)?; // TODO How many bytes in data?
+    let (i, fcs) = be_u32(i)?;
+    Ok((
+        i,
+        Frame {
             fc,
             dur_id,
             address1,
@@ -303,14 +325,10 @@ named!(frame<&[u8],Frame>,
             qos_ctrl,
             ht_ctrl,
             body,
-            fcs
-        } )
-    )
-);
-        //qos_control: cond!( match(fc.frametype) {
-        //    FrameType::Data(d) => d.qos,
-        //    _ => false
-        //}, be_u16! ) >>
+            fcs,
+        },
+    ))
+}
 
 fn main() {
     println!("Hello, world!");

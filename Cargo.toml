@@ -5,5 +5,5 @@ authors = ["tomhol"]
 edition = "2018"
 
 [dependencies]
-nom = "^4.2"
-eui48 = "0.4.6"
+nom = "5"
+eui48 = "1.0"
